@@ -1,5 +1,5 @@
 """
-PXBlendSC ML Strategy implementation.
+PXBlendSC-RF ML Strategy implementation.
 
 This strategy implements a ML pipeline combining:
 - LightGBM and SVM models with blending
@@ -48,7 +48,7 @@ from thrift_gen.mlengine.ttypes import CategoricalPredictionResult
 from .ml_strategy_base import MLModelStrategy
 
 try:
-    from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+    from lightgbm import LGBMClassifier
 
     HAS_LGBM = True
 except ImportError:
@@ -116,8 +116,32 @@ def _check_cancellation():
 
 
 def label_prefixes(classes: list[str]) -> list[str]:
-    """Extract prefixes from class labels (first 3 characters)."""
-    return [str(cls)[:3] if len(str(cls)) >= 3 else str(cls) for cls in classes]
+    """
+    Extract hierarchical prefixes from class labels.
+
+    For categories in format "Category: Subcategory", extracts "Category".
+    For categories without colon, uses entire category name.
+
+    Examples:
+        "Monthly Spending: Groceries" -> "Monthly Spending"
+        "Transportation: Gas" -> "Transportation"
+        "Income" -> "Income"
+
+    Args:
+        classes: List of category names
+
+    Returns:
+        List of extracted prefixes
+    """
+    prefixes = []
+    for cls in classes:
+        cls_str = str(cls)
+        if ":" in cls_str:
+            prefix = cls_str.split(":", 1)[0].strip()
+        else:
+            prefix = cls_str.strip()
+        prefixes.append(prefix)
+    return prefixes
 
 
 def make_generic_normalizer(use_generic_noise: bool, alias_map: dict):
@@ -157,7 +181,7 @@ def convert_numpy_types(obj):
         return obj.tolist()
     elif isinstance(obj, dict):
         return {k: convert_numpy_types(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
+    elif isinstance(obj, list | tuple):
         return [convert_numpy_types(item) for item in obj]
     return obj
 
@@ -219,14 +243,146 @@ def capped_ros_strategy(y: np.ndarray, cap_percentile: float) -> dict[int, int]:
             target = max(n, min(min_samples * 2, cap // 2))
             strategy[c] = target
         elif n < cap:
-            # Moderate upsampling for underrepresented classes
-            target = min(cap, n * 3)  # Max 3x original size
+            # Conservative upsampling for underrepresented classes
+            target = min(cap, int(n * 1.5))  # Max 1.5x original size (rounded down)
             strategy[c] = max(n, target)
         else:
             # Keep original size for well-represented classes
             strategy[c] = n
 
     return strategy
+
+
+# =============================================================================
+# RECENCY-FREQUENCY MODEL
+# =============================================================================
+
+
+class RecencyFrequencyModel:
+    """
+    Model that predicts based on payee categorization history.
+
+    Combines frequency (how often a payee goes to each category) with
+    recency (recent categorizations matter more) to make predictions.
+    """
+
+    def __init__(
+        self,
+        recency_weight=0.7,
+        frequency_weight=0.3,
+        min_frequency=2,
+        lookback_window=50,
+        recency_window=5,
+    ):
+        self.recency_weight = recency_weight
+        self.frequency_weight = frequency_weight
+        self.min_frequency = min_frequency
+        self.lookback_window = lookback_window
+        self.recency_window = recency_window
+        self.payee_patterns = {}
+        self.n_classes = 0
+
+    def fit(self, X, y, dates=None):
+        """
+        Learn payee categorization patterns from training data.
+
+        Args:
+            X: DataFrame with PAYEE_NORM column
+            y: Category labels (encoded)
+            dates: Optional dates for recency weighting
+        """
+        self.n_classes = len(np.unique(y))
+        self.payee_patterns = {}
+
+        # If no dates provided, use sequential ordering
+        if dates is None:
+            dates = list(range(len(y)))
+
+        # Build payee history
+        for i, (payee, category, date) in enumerate(
+            zip(X["PAYEE_NORM"], y, dates, strict=False)
+        ):
+            if pd.isna(payee) or payee == "":
+                continue
+
+            if payee not in self.payee_patterns:
+                self.payee_patterns[payee] = []
+
+            self.payee_patterns[payee].append((int(category), date, i))
+
+        # Sort each payee's history by date and keep only recent transactions
+        for payee in self.payee_patterns:
+            history = sorted(self.payee_patterns[payee], key=lambda x: x[1])
+            self.payee_patterns[payee] = history[-self.lookback_window :]
+
+        logger.info(
+            f"RecencyFrequency model: learned patterns for {len(self.payee_patterns)} payees"
+        )
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predict category probabilities based on payee history.
+
+        Args:
+            X: DataFrame with PAYEE_NORM column
+
+        Returns:
+            Array of shape (n_samples, n_classes) with probabilities
+        """
+        probas = []
+
+        for payee in X["PAYEE_NORM"]:
+            proba = self._get_payee_proba(payee)
+            probas.append(proba)
+
+        return np.array(probas)
+
+    def _get_payee_proba(self, payee):
+        """Get probability distribution for a specific payee."""
+        if pd.isna(payee) or payee == "" or payee not in self.payee_patterns:
+            # No history - return uniform distribution
+            return np.ones(self.n_classes) / self.n_classes
+
+        history = self.payee_patterns[payee]
+        if len(history) == 0:
+            return np.ones(self.n_classes) / self.n_classes
+
+        # Calculate frequency scores
+        categories = [cat for cat, date, idx in history]
+        category_counts = Counter(categories)
+
+        # Calculate recency scores (recent transactions matter more)
+        recent_categories = [cat for cat, date, idx in history[-self.recency_window :]]
+        recent_counts = Counter(recent_categories)
+
+        # Build probability distribution
+        scores = np.zeros(self.n_classes)
+
+        for category, count in category_counts.items():
+            if count >= self.min_frequency and category < self.n_classes:
+                # Frequency component
+                frequency_score = count / len(history)
+
+                # Recency component
+                recency_score = recent_counts.get(category, 0) / len(recent_categories)
+
+                # Combined score
+                combined_score = (
+                    self.frequency_weight * frequency_score
+                    + self.recency_weight * recency_score
+                )
+
+                scores[category] = combined_score
+
+        # Normalize to probabilities
+        if scores.sum() > 0:
+            scores = scores / scores.sum()
+        else:
+            # Fallback to uniform if no valid patterns
+            scores = np.ones(self.n_classes) / self.n_classes
+
+        return scores
 
 
 # =============================================================================
@@ -1061,38 +1217,78 @@ def pick_tail_class_thresholds(
     tail_classes: set,
     thresholds: np.ndarray,
 ) -> np.ndarray | None:
-    """Pick thresholds for tail classes."""
+    """
+    Pick optimal thresholds for tail classes based on actual performance.
+
+    For each tail class, finds the threshold that maximizes F1 score
+    by comparing actual predictions vs ground truth at different
+    confidence levels.
+
+    Args:
+        y_true: Ground truth labels
+        proba: Predicted probabilities (n_samples, n_classes)
+        n_classes: Total number of classes
+        tail_classes: Set of class indices considered as tail classes
+        thresholds: Array of threshold values to test
+
+    Returns:
+        Array of optimal thresholds per class, or None if no tail classes
+    """
     if not tail_classes:
         return None
 
-    class_thresholds = np.full(n_classes, 0.0)
+    class_thresholds = np.full(n_classes, np.nan)
+
+    # Get predicted classes for all samples
+    y_pred_all = proba.argmax(axis=1)
+
+    logger.debug(f"Learning thresholds for {len(tail_classes)} tail classes")
 
     for class_idx in tail_classes:
         if class_idx >= n_classes:
             continue
 
+        # Check if we have enough samples of this class in ground truth
         class_mask = y_true == class_idx
         if class_mask.sum() < 5:
+            logger.debug(
+                f"Class {class_idx}: insufficient samples ({class_mask.sum()}), skipping"
+            )
             continue
-
-        class_proba = proba[class_mask, class_idx]
 
         best_f1 = 0.0
         best_threshold = thresholds[0]
 
         for threshold in thresholds:
-            pred_mask = class_proba >= threshold
-            if pred_mask.sum() > 0:
-                y_true_class = np.ones(pred_mask.sum())
-                y_pred_class = np.ones(pred_mask.sum())
-                f1 = f1_score(
-                    y_true_class, y_pred_class, average="macro", zero_division=0
-                )
+            # Apply threshold: only predict this class if confidence >= threshold
+            confident_mask = proba[:, class_idx] >= threshold
+
+            # Create binary predictions: 1 if we predict this class with confidence, 0 otherwise
+            y_pred_binary = (y_pred_all == class_idx) & confident_mask
+            y_true_binary = y_true == class_idx
+
+            # Calculate F1 for this class at this threshold
+            if y_pred_binary.sum() > 0 or y_true_binary.sum() > 0:
+                f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
                 if f1 > best_f1:
                     best_f1 = f1
                     best_threshold = threshold
 
         class_thresholds[class_idx] = float(best_threshold)
+        logger.debug(
+            f"Class {class_idx}: threshold={best_threshold:.3f}, F1={best_f1:.3f}"
+        )
+
+    # Log summary statistics
+    valid_thresholds = class_thresholds[~np.isnan(class_thresholds)]
+    if len(valid_thresholds) > 0:
+        logger.info(f"Learned thresholds for {len(valid_thresholds)} tail classes")
+        logger.info(
+            f"Threshold range: {valid_thresholds.min():.3f} - {valid_thresholds.max():.3f}"
+        )
+        logger.info(f"Mean threshold: {valid_thresholds.mean():.3f}")
+    else:
+        logger.warning("No valid thresholds learned for tail classes")
 
     return class_thresholds
 
@@ -1103,7 +1299,7 @@ def pick_tail_class_thresholds(
 
 
 class ModelBundle:
-    """Complete model bundle for PXBlendSC strategy."""
+    """Complete model bundle for PXBlendSC-RF strategy."""
 
     def __init__(
         self,
@@ -1112,6 +1308,7 @@ class ModelBundle:
         feature_pipe,
         lgbm_model,
         svm_model,
+        rf_model=None,
         lgbm_weight,
         prefix_clf,
         prefix_label_encoder,
@@ -1127,7 +1324,10 @@ class ModelBundle:
         self.feature_pipe = feature_pipe
         self.lgbm = lgbm_model
         self.svm = svm_model
+        self.rf = rf_model
         self.lgbm_weight = float(lgbm_weight)
+        self.svm_weight = float(cfg["models"].get("svm_weight", 0.25))
+        self.rf_weight = float(cfg["models"].get("recency_freq_weight", 0.25))
         self.prefix_clf = prefix_clf
         self.prefix_le = prefix_label_encoder
         self.label_encoder = label_encoder
@@ -1152,6 +1352,8 @@ class ModelBundle:
             dump(self.lgbm, os.path.join(folder, "lgbm.joblib"))
         if self.svm is not None:
             dump(self.svm, os.path.join(folder, "svm.joblib"))
+        if self.rf is not None:
+            dump(self.rf, os.path.join(folder, "rf.joblib"))
 
         # Save artifact with full configuration
         artifact = {
@@ -1162,6 +1364,7 @@ class ModelBundle:
             "prefix_clf": "prefix_clf.joblib",
             "lgbm": "lgbm.joblib" if self.lgbm is not None else None,
             "svm": "svm.joblib" if self.svm is not None else None,
+            "rf": "rf.joblib" if self.rf is not None else None,
             "mem_payee": self.mem_payee,
             "mem_account": self.mem_account,
             "mem_payee_amount": self.mem_payee_amount,
@@ -1182,6 +1385,8 @@ class ModelBundle:
             },
             "classes": self.classes,
             "lgbm_weight": self.lgbm_weight,
+            "svm_weight": self.svm_weight,
+            "rf_weight": self.rf_weight,
             "prefix_to_ids": {
                 k: list(map(int, v)) for k, v in self.prefix_to_ids.items()
             },
@@ -1213,12 +1418,17 @@ class ModelBundle:
         if artifact["svm"] is not None:
             svm_model = load(os.path.join(folder, artifact["svm"]))
 
+        rf_model = None
+        if artifact.get("rf") is not None:
+            rf_model = load(os.path.join(folder, artifact["rf"]))
+
         return ModelBundle(
             cfg=artifact["cfg"],
             feature_pipe=feature_pipe,
             lgbm_model=lgbm_model,
             svm_model=svm_model,
-            lgbm_weight=artifact["lgbm_weight"],
+            rf_model=rf_model,
+            lgbm_weight=artifact.get("lgbm_weight", 0.7),
             prefix_clf=prefix_clf,
             prefix_label_encoder=prefix_le,
             label_encoder=label_encoder,
@@ -1251,7 +1461,7 @@ class ModelBundle:
         pref_str = self.prefix_le.inverse_transform(pref_idx)
 
         # Get base probabilities and blend
-        proba = self._get_blended_probabilities(Xfeats)
+        proba = self._get_blended_probabilities(Xfeats, df)
 
         # Apply prefix and priors
         x_norm = self.feature_pipe.named_steps["add_text"].transform(df.copy())
@@ -1299,25 +1509,44 @@ class ModelBundle:
             return results, proba
         return results
 
-    def _get_blended_probabilities(self, Xfeats):
+    def _get_blended_probabilities(self, Xfeats, df):
         """Get blended probabilities from models."""
         n_classes = len(self.classes)
 
         # Base probabilities
         proba_l = self.lgbm.predict_proba(Xfeats) if self.lgbm is not None else None
         proba_s = self.svm.predict_proba(Xfeats) if self.svm is not None else None
+        proba_rf = self.rf.predict_proba(df) if self.rf is not None else None
 
         # Align to full class space
         if proba_l is not None:
             proba_l = pad_proba(self.lgbm, proba_l, n_classes)
         if proba_s is not None:
             proba_s = pad_proba(self.svm, proba_s, n_classes)
+        # proba_rf is already in full class space
 
-        # Blend models
-        if proba_l is not None and proba_s is not None:
-            proba = self.lgbm_weight * proba_l + (1.0 - self.lgbm_weight) * proba_s
+        # Blend all available models
+        total_weight = 0
+        proba = np.zeros((len(df), n_classes))
+
+        if proba_l is not None:
+            proba += self.lgbm_weight * proba_l
+            total_weight += self.lgbm_weight
+
+        if proba_s is not None:
+            proba += self.svm_weight * proba_s
+            total_weight += self.svm_weight
+
+        if proba_rf is not None:
+            proba += self.rf_weight * proba_rf
+            total_weight += self.rf_weight
+
+        # Normalize weights if not all models are available
+        if total_weight > 0:
+            proba = proba / total_weight
         else:
-            proba = proba_l if proba_l is not None else proba_s
+            # Fallback to uniform distribution
+            proba = np.ones((len(df), n_classes)) / n_classes
 
         return proba
 
@@ -1426,7 +1655,6 @@ def perform_cross_validation(
     df: pd.DataFrame,
     y: np.ndarray,
     cfg: dict,
-    feature_pipe,
     prefix_le,
     adjusted_n_folds: int,
 ):
@@ -1436,24 +1664,7 @@ def perform_cross_validation(
     )
 
     logger.info("Using sequential processing for optimal performance on small datasets")
-
-    # Pre-compute features once for speed (datasets always < 10K)
-    logger.info(
-        f"Dataset ({len(df)} rows) - pre-computing features for optimal performance"
-    )
-    X_precomputed = None
-
-    # Pre-compute features once (with timing)
-    try:
-        start_time = time.time()
-        X_precomputed = feature_pipe.fit_transform(df)
-        feature_time = time.time() - start_time
-        logger.info(
-            f"Pre-computed features shape: {X_precomputed.shape} in {feature_time:.2f}s"
-        )
-    except Exception as e:
-        logger.warning(f"Failed to pre-compute features: {e}")
-        X_precomputed = None
+    logger.info(f"Dataset ({len(df)} rows) - building feature pipeline per fold")
 
     def _fold(tr_idx, va_idx):
         _check_cancellation()
@@ -1462,16 +1673,10 @@ def perform_cross_validation(
         df_tr, df_va = df.iloc[tr_idx].copy(), df.iloc[va_idx].copy()
         y_tr, y_va = y[tr_idx], y[va_idx]
 
-        # Use pre-computed features if available, otherwise build fresh pipeline
-        if X_precomputed is not None:
-            # Just slice the pre-computed features
-            X_tr, X_va = X_precomputed[tr_idx], X_precomputed[va_idx]
-        else:
-            # Fallback: build fresh pipeline for this fold (slower)
-            logger.warning("Building fresh pipeline for fold - this will be slower")
-            fold_pipe = build_feature_pipeline(cfg)
-            X_tr = fold_pipe.fit_transform(df_tr, y_tr)
-            X_va = fold_pipe.transform(df_va)
+        # Build feature pipeline on training fold ONLY
+        fold_feature_pipe = build_feature_pipeline(cfg)
+        X_tr = fold_feature_pipe.fit_transform(df_tr, y_tr)
+        X_va = fold_feature_pipe.transform(df_va)  # Transform only
 
         # Resampling
         sampler = RandomOverSampler(
@@ -1482,30 +1687,24 @@ def perform_cross_validation(
         )
         X_tr_rs, y_tr_rs = sampler.fit_resample(X_tr, y_tr)
 
-        # Train models - use thread limiting only for larger datasets
+        # Train models with CONSISTENT parameters from config
         proba_l = proba_s = None
 
         if cfg["models"]["use_lgbm"] and HAS_LGBM:
-            # Optimize LightGBM settings for small datasets (always < 10K)
-            lgbm_params = cfg["models"]["lgbm_params"].copy()
-            lgbm_params["n_estimators"] = min(25, lgbm_params.get("n_estimators", 100))
-            lgbm_params["max_depth"] = min(3, lgbm_params.get("max_depth", 6))
-            lgbm_params["num_leaves"] = min(15, lgbm_params.get("num_leaves", 31))
-            lgbm_params["min_data_in_leaf"] = max(
-                1, min(5, lgbm_params.get("min_data_in_leaf", 20))
-            )
-            logger.info(
-                f"Optimized LightGBM params for dataset: n_estimators={lgbm_params['n_estimators']}"
-            )
-
             lgbm = LGBMClassifier(
                 objective="multiclass",
                 random_state=int(cfg["random_state"]),
-                n_jobs=-1,  # Use all available threads
-                **lgbm_params,
+                n_jobs=-1,
+                **cfg["models"]["lgbm_params"],  # Use config params directly
             )
             lgbm.set_params(num_class=len(np.unique(y)))
-            lgbm.fit(X_tr_rs, y_tr_rs)
+            lgbm.fit(
+                X_tr_rs,
+                y_tr_rs,
+                eval_set=[(X_va, y_va)],
+                eval_metric="multi_logloss",
+                callbacks=[CancellationCallback()],
+            )
             proba_l = lgbm.predict_proba(X_va)
 
         if cfg["models"]["use_svm_blend"]:
@@ -1518,7 +1717,7 @@ def perform_cross_validation(
                 svm_base = CancellableEstimator(
                     SGDClassifier(
                         loss="log_loss",
-                        alpha=1e-4,
+                        alpha=1e-2,
                         max_iter=2000,
                         class_weight="balanced",
                         random_state=int(cfg["random_state"]),
@@ -1539,19 +1738,74 @@ def perform_cross_validation(
                 )
                 proba_s = None
 
+        # Train recency-frequency model
+        proba_rf = None
+        if cfg["models"]["use_recency_frequency"]:
+            try:
+                rf_params = cfg["models"]["recency_freq_params"]
+                rf_model = RecencyFrequencyModel(**rf_params)
+
+                # Use training data with dates (if available) or indices
+                dates = df_tr.get("date", list(range(len(df_tr))))
+                rf_model.fit(df_tr, y_tr, dates)
+                proba_rf = rf_model.predict_proba(df_va)
+
+            except Exception as e:
+                logger.warning(f"RecencyFrequency training failed: {e}")
+                logger.info(
+                    "Skipping RecencyFrequency for this fold due to training issues"
+                )
+                proba_rf = None
+
         # Blend probabilities
-        lgbm_weight = float(cfg["models"]["lgbm_weight"])
+        lgbm_weight = float(cfg["models"].get("lgbm_weight", 0.5))
+        svm_weight = float(cfg["models"].get("svm_weight", 0.25))
+        rf_weight = float(cfg["models"].get("recency_freq_weight", 0.25))
         n_classes = len(np.unique(y))
 
+        # Pad probabilities to full class space
         if proba_l is not None:
             proba_l = pad_proba(lgbm, proba_l, n_classes)
         if proba_s is not None:
             proba_s = pad_proba(svm, proba_s, n_classes)
+        # proba_rf is already in full class space
 
-        if proba_l is not None and proba_s is not None:
-            proba_va = lgbm_weight * proba_l + (1.0 - lgbm_weight) * proba_s
+        # Blend all available models
+        total_weight = 0
+        proba_va = np.zeros((len(df_va), n_classes))
+
+        if proba_l is not None:
+            proba_va += lgbm_weight * proba_l
+            total_weight += lgbm_weight
+
+        if proba_s is not None:
+            proba_va += svm_weight * proba_s
+            total_weight += svm_weight
+
+        if proba_rf is not None:
+            proba_va += rf_weight * proba_rf
+            total_weight += rf_weight
+
+        # Normalize weights if not all models are available
+        if total_weight > 0:
+            proba_va = proba_va / total_weight
         else:
-            proba_va = proba_l if proba_l is not None else proba_s
+            # Fallback to uniform distribution
+            proba_va = np.ones((len(df_va), n_classes)) / n_classes
+
+        # Build memories on training fold ONLY
+        train_norm = fold_feature_pipe.named_steps["add_text"].transform(df_tr.copy())
+        fold_memories = {
+            "payee": build_payee_memory(
+                train_norm, y_tr, n_min=int(cfg["priors"]["vendor"]["min_count"])
+            ),
+            "account": build_account_memory(
+                train_norm, y_tr, n_min=int(cfg["priors"]["vendor"]["min_count"])
+            ),
+            "payee_amount": build_payee_amount_patterns(
+                train_norm, y_tr, cfg["columns"]["NUM_COLS"][0], n_min=3
+            ),
+        }
 
         # Prefix predictions
         y_prefix_tr = prefix_le.fit_transform(label_prefixes(y_tr.astype(str)))
@@ -1565,12 +1819,30 @@ def perform_cross_validation(
         prefix_clf.fit(X_tr, y_prefix_tr)
         pref_pred_va = prefix_le.inverse_transform(prefix_clf.predict(X_va))
 
+        # Apply prefix and priors using fold-specific memories
+        val_norm = fold_feature_pipe.named_steps["add_text"].transform(df_va.copy())
+
+        # Get prefix constraints
+        prefix_of = np.array(label_prefixes(np.unique(y_tr).astype(str)))
+        prefix_to_ids = {
+            p: np.where(prefix_of == p)[0].tolist() for p in sorted(set(prefix_of))
+        }
+
+        proba_va = apply_prefix_and_priors(
+            proba_va,
+            pref_pred_va,
+            val_norm,
+            prefix_to_ids,
+            fold_memories["payee"],
+            fold_memories["account"],
+            fold_memories["payee_amount"],
+            amount_col=cfg["columns"]["NUM_COLS"][0],
+        )
+
         return y_va, proba_va, pref_pred_va
 
     # Run cross-validation sequentially (datasets always < 10K)
     logger.info("Running CV sequentially for optimal performance")
-    backend = "sequential"
-    prefer = "none"
     jobs = []
 
     for fold_idx, (tr, va) in enumerate(skf.split(df, y)):
@@ -1586,18 +1858,13 @@ def perform_cross_validation(
     val_proba = np.vstack([j[1] for j in jobs])
     val_pref = np.array(sum([list(j[2]) for j in jobs], []))
 
-    # Return performance info
-    perf_info = {
-        "precompute_features": X_precomputed is not None,
-        "backend": backend,
-        "prefer": prefer,
-    }
-
-    return val_true, val_proba, val_pref, perf_info
+    return val_true, val_proba, val_pref
 
 
 def learn_thresholds(val_true, val_proba, val_pref, cfg, n_classes):
     """Learn optimal thresholds from validation data."""
+    logger.info(f"Learning thresholds from {len(val_true)} validation samples")
+
     TH = cfg["thresholds"]
     THR_GRID = np.asarray(TH["global_grid"], dtype=float)
 
@@ -1646,15 +1913,58 @@ def learn_thresholds(val_true, val_proba, val_pref, cfg, n_classes):
         np.where(f1_per_class <= TAIL_MAX_F1)[0].tolist()
     )
 
+    # Log tail class identification details
+    logger.info(f"Identified {len(tail_classes)} tail classes for threshold learning")
+    logger.debug(f"Tail class criteria: support <= {TAIL_MAX_SUP}, F1 <= {TAIL_MAX_F1}")
+
+    if tail_classes:
+        logger.debug("Tail classes identified:")
+        for class_idx in sorted(tail_classes):
+            support = counts[class_idx] if class_idx < len(counts) else 0
+            f1 = f1_per_class[class_idx] if class_idx < len(f1_per_class) else 0.0
+            logger.debug(f"  Class {class_idx}: support={support}, F1={f1:.3f}")
+
+    # Calculate baseline abstention rate before tail thresholds
+    baseline_abstentions = (val_proba.max(axis=1) < thr_global).sum()
+    baseline_abstention_rate = baseline_abstentions / len(val_true)
+    logger.info(
+        f"Baseline abstention rate (global threshold): {baseline_abstention_rate:.1%}"
+    )
+
     thr_per_class = pick_tail_class_thresholds(
         val_true, val_proba, n_classes, tail_classes, TAIL_GRID
     )
+
+    # Log impact of tail class thresholds on abstention rate
+    if thr_per_class is not None:
+        # Simulate abstention rate with tail thresholds
+        y_pred_with_tail = val_proba.argmax(axis=1)
+        abstain_mask = val_proba.max(axis=1) < thr_global
+
+        # Apply per-class thresholds
+        for class_idx in range(n_classes):
+            if not np.isnan(thr_per_class[class_idx]):
+                class_predictions = y_pred_with_tail == class_idx
+                low_confidence = val_proba[:, class_idx] < thr_per_class[class_idx]
+                abstain_mask |= class_predictions & low_confidence
+
+        tail_abstentions = abstain_mask.sum()
+        tail_abstention_rate = tail_abstentions / len(val_true)
+        additional_abstentions = tail_abstentions - baseline_abstentions
+
+        logger.info(f"Abstention rate with tail thresholds: {tail_abstention_rate:.1%}")
+        logger.info(
+            f"Additional abstentions from tail thresholds: {additional_abstentions} ({additional_abstentions / len(val_true):.1%})"
+        )
+    else:
+        logger.info("No tail class thresholds learned")
 
     return thr_global, thr_per_prefix, thr_per_class
 
 
 def train_final_models(df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds=3):
     """Train final models on all data."""
+    logger.info(f"Final model training: received {len(y)} samples for training")
     # No threadpool limits needed for small datasets (< 10K)
     X_all_ft = feature_pipe.fit_transform(df, y)
 
@@ -1663,6 +1973,9 @@ def train_final_models(df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds=3):
         sampling_strategy=capped_ros_strategy(y, cfg["sampler"]["ros_cap_percentile"]),
     )
     X_all, y_all = sampler_all.fit_resample(X_all_ft, y)
+    logger.info(
+        f"Final model training: using {len(y_all)} samples after resampling (original: {len(y)})"
+    )
 
     # Prefix classifier
     y_prefix_all = prefix_le.fit_transform(label_prefixes(y.astype(str)))
@@ -1679,23 +1992,30 @@ def train_final_models(df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds=3):
     lgbm_full = svm_full = None
 
     if cfg["models"]["use_lgbm"] and HAS_LGBM:
-        # Optimize LightGBM settings for small datasets (always < 10K)
-        lgbm_params = cfg["models"]["lgbm_params"].copy()
-        lgbm_params["n_estimators"] = min(25, lgbm_params.get("n_estimators", 100))
-        lgbm_params["max_depth"] = min(3, lgbm_params.get("max_depth", 6))
-        lgbm_params["num_leaves"] = min(15, lgbm_params.get("num_leaves", 31))
-        lgbm_params["min_data_in_leaf"] = max(
-            1, min(5, lgbm_params.get("min_data_in_leaf", 20))
-        )
-
         lgbm_full = LGBMClassifier(
             objective="multiclass",
             random_state=int(cfg["random_state"]),
-            n_jobs=-1,  # Use all threads for small datasets
-            **lgbm_params,
+            n_jobs=-1,
+            **cfg["models"]["lgbm_params"],  # Use config params directly
         )
         lgbm_full.set_params(num_class=len(np.unique(y)))
-        lgbm_full.fit(X_all, y_all)
+
+        # Create validation split for early stopping in final training
+        X_train_final, X_val_final, y_train_final, y_val_final = train_test_split(
+            X_all,
+            y_all,
+            test_size=0.2,
+            random_state=int(cfg["random_state"]),
+            stratify=y_all,
+        )
+
+        lgbm_full.fit(
+            X_train_final,
+            y_train_final,
+            eval_set=[(X_val_final, y_val_final)],
+            eval_metric="multi_logloss",
+            callbacks=[CancellationCallback()],
+        )
 
         if cfg["models"]["use_svm_blend"]:
             # Determine appropriate CV folds for calibration based on resampled data
@@ -1707,7 +2027,7 @@ def train_final_models(df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds=3):
             svm_base = CancellableEstimator(
                 SGDClassifier(
                     loss="log_loss",
-                    alpha=1e-4,
+                    alpha=1e-2,
                     max_iter=2000,
                     class_weight="balanced",
                     random_state=int(cfg["random_state"]),
@@ -1720,7 +2040,23 @@ def train_final_models(df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds=3):
             )
             svm_full.fit(X_all, y_all)
 
-    return lgbm_full, svm_full, prefix_clf
+    # Train final recency-frequency model
+    rf_full = None
+    if cfg["models"]["use_recency_frequency"]:
+        try:
+            rf_params = cfg["models"]["recency_freq_params"]
+            rf_full = RecencyFrequencyModel(**rf_params)
+
+            # Use original data (not resampled) for recency-frequency patterns
+            dates = df.get("date", list(range(len(df))))
+            rf_full.fit(df, y, dates)
+            logger.info("Final RecencyFrequency model trained successfully")
+
+        except Exception as e:
+            logger.warning(f"Final RecencyFrequency training failed: {e}")
+            rf_full = None
+
+    return lgbm_full, svm_full, rf_full, prefix_clf
 
 
 def calculate_metrics(y_true, y_hat, abstain_mask, metric_prefix=""):
@@ -1780,119 +2116,12 @@ def _get_model_predictions(lgbm_model, svm_model, X_features, lgbm_weight, n_cla
         return proba_l if proba_l is not None else proba_s
 
 
-def _perform_final_retraining(
-    df,
-    y,
-    cfg,
-    feature_pipe,
-    prefix_le,
-    lgbm_full,
-    svm_full,
-    prefix_clf,
-    memories,
-    thr_global,
-    thr_per_prefix,
-    thr_per_class,
-    n_classes,
-    adjusted_n_folds,
-    lgbm_weight,
-    random_state,
-    date_col,
-    num_col,
-):
-    """Perform final retraining with train/test split and return metrics."""
-    # Calculate appropriate test size based on dataset and number of classes
-    total_samples = len(df)
-
-    # Ensure we have at least 2 samples per class in test set, but not more than 20% of data
-    min_test_samples = max(
-        n_classes * 2, 10
-    )  # At least 2 per class or 10 samples minimum
-    max_test_samples = int(total_samples * 0.20)  # Maximum 20% of data
-
-    # Choose test size that ensures stratification works
-    if total_samples <= min_test_samples * 2:
-        test_samples = min_test_samples
-    else:
-        test_samples = min(min_test_samples, max_test_samples)
-
-    test_size = test_samples / total_samples
-
-    logger.info(
-        f"Using {test_samples} samples ({test_size:.1%}) for final test evaluation"
-    )
-
-    # Reserve a test set for final model evaluation
-    df_train_final, df_test_final, y_train_final, y_test_final = train_test_split(
-        df, y, test_size=test_size, random_state=random_state, stratify=y
-    )
-
-    logger.info(f"Reserved {len(df_test_final)} samples for final test evaluation")
-
-    # Retrain final models using existing train_final_models function
-    lgbm_final, svm_final, prefix_clf_final = train_final_models(
-        df_train_final, y_train_final, cfg, feature_pipe, prefix_le, adjusted_n_folds
-    )
-
-    # Rebuild memories using existing build_all_memories function
-    updated_memories = build_all_memories(
-        df_train_final, y_train_final, feature_pipe, cfg, date_col, num_col
-    )
-
-    # Evaluate final model on reserved test set
-    logger.info("Evaluating final retrained model on reserved test set...")
-
-    # Get test predictions using existing helper function
-    X_test_final = feature_pipe.transform(df_test_final)
-    final_pref_idx = prefix_clf_final.predict(X_test_final)
-    final_pref = prefix_le.inverse_transform(final_pref_idx)
-    final_proba = _get_model_predictions(
-        lgbm_final, svm_final, X_test_final, lgbm_weight, n_classes
-    )
-
-    # Apply thresholds to get final predictions
-    y_hat_final, abst_final = apply_thresholds(
-        final_proba, final_pref, thr_global, thr_per_prefix, thr_per_class
-    )
-
-    # Calculate final test metrics
-    final_test_metrics = calculate_metrics(
-        y_test_final, y_hat_final, abst_final, "final_"
-    )
-
-    logger.info(f"Final retraining completed on {len(y_train_final)} samples")
-    logger.info(
-        f"Final model test performance: F1={final_test_metrics['final_macro_f1']:.4f}, "
-        f"Acc={final_test_metrics['final_accuracy']:.4f}, "
-        f"Abstain={final_test_metrics['final_abstain_rate']:.2%}"
-    )
-
-    return {
-        **final_test_metrics,
-        "updated_memories": updated_memories,  # Return the updated memories
-        "updated_models": {  # Return the updated models for bundle update
-            "lgbm": lgbm_final,
-            "svm": svm_final,
-            "prefix_clf": prefix_clf_final,
-        },
-        "final_retraining": {
-            "enabled": True,
-            "final_training_samples": int(len(y_train_final)),
-            "test_samples": int(len(y_test_final)),
-            "test_size_percent": f"{test_size:.1%}",
-            "note": f"Final model trained on {len(y_train_final)} samples, evaluated on {len(y_test_final)} test samples",
-        },
-    }
-
-
 def train_model_bundle(
     cfg: dict[str, Any], train_df: pd.DataFrame
 ) -> tuple[ModelBundle, dict[str, float]]:
-    """Train complete PXBlendSC model bundle."""
+    """Train complete PXBlendSC-RF model bundle."""
     # Setup
-    RANDOM_STATE = int(cfg["random_state"])
     N_FOLDS = int(cfg["cv"]["n_folds"])
-    N_CPUS = os.cpu_count() or 4
     LABEL_COL = cfg["columns"]["LABEL_COL"]
     TEXT_COLS = cfg["columns"]["TEXT_COLS"]
     NUM_COL = cfg["columns"]["NUM_COLS"][0]
@@ -1939,8 +2168,8 @@ def train_model_bundle(
     logger.info(f"Final CV setup: {adjusted_n_folds} folds, {n_classes} classes")
 
     # Cross-validation
-    val_true, val_proba, val_pref, perf_info = perform_cross_validation(
-        df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds
+    val_true, val_proba, val_pref = perform_cross_validation(
+        df, y, cfg, prefix_le, adjusted_n_folds
     )
 
     # Learn thresholds
@@ -1955,7 +2184,8 @@ def train_model_bundle(
     cv_metrics = calculate_metrics(val_true, y_hat_cv, abst_cv, "cv_")
 
     # Final fit on all data
-    lgbm_full, svm_full, prefix_clf = train_final_models(
+    logger.info(f"Training final models on all {len(y)} samples")
+    lgbm_full, svm_full, rf_full, prefix_clf = train_final_models(
         df, y, cfg, feature_pipe, prefix_le, adjusted_n_folds
     )
 
@@ -2013,47 +2243,8 @@ def train_model_bundle(
 
     total_metrics = calculate_metrics(total_true, y_hat_total, abst_total, "total_")
 
-    # Optional: Final retraining on all data (if enabled in config)
-    final_metrics = {}
-    FINAL_RETRAIN = bool(cfg["models"].get("final_retraining", False))
-    if FINAL_RETRAIN:
-        logger.info("Performing final retraining with test set evaluation...")
-        final_metrics = _perform_final_retraining(
-            df,
-            y,
-            cfg,
-            feature_pipe,
-            prefix_le,
-            lgbm_full,
-            svm_full,
-            prefix_clf,
-            memories,
-            thr_global,
-            thr_per_prefix,
-            thr_per_class,
-            n_classes,
-            adjusted_n_folds,
-            LGBM_WEIGHT,
-            RANDOM_STATE,
-            DATE_COL,
-            NUM_COL,
-        )
-
-        # Update models and memories with final retrained versions
-        if "updated_models" in final_metrics:
-            lgbm_full = final_metrics["updated_models"]["lgbm"]
-            svm_full = final_metrics["updated_models"]["svm"]
-            prefix_clf = final_metrics["updated_models"]["prefix_clf"]
-
-        if "updated_memories" in final_metrics:
-            memories = final_metrics["updated_memories"]
-    else:
-        final_metrics = {
-            "final_retraining": {
-                "enabled": False,
-                "note": "Final model uses only original training data",
-            }
-        }
+    # Final model trains on all available data (training + validation combined)
+    logger.info(f"Final model trained on all {len(y)} samples")
 
     # Create bundle
     thresholds = {
@@ -2069,6 +2260,7 @@ def train_model_bundle(
         feature_pipe=feature_pipe,
         lgbm_model=lgbm_full,
         svm_model=svm_full,
+        rf_model=rf_full,
         lgbm_weight=LGBM_WEIGHT,
         prefix_clf=prefix_clf,
         prefix_label_encoder=prefix_le,
@@ -2089,8 +2281,6 @@ def train_model_bundle(
         **train_metrics,
         # Total dataset metrics (both training and validation)
         **total_metrics,
-        # Final retraining metrics (if available)
-        **final_metrics,
         # Dataset composition
         "dataset_info": {
             "total_samples": int(total_samples),
@@ -2109,7 +2299,6 @@ def train_model_bundle(
             if thr_per_class is not None
             else {},
         },
-        "performance": perf_info,
     }
 
     return bundle, metrics
@@ -2121,18 +2310,18 @@ def train_model_bundle(
 
 
 class PXBlendSCStrategy(MLModelStrategy):
-    """PXBlendSC ML strategy implementation."""
+    """PXBlendSC-RF ML strategy implementation."""
 
     def get_model_type(self) -> ModelType:
         return ModelType.PXBlendSC
 
     def _get_default_config(self) -> dict:
-        """Get default PXBlendSC configuration from ConfigDefaults."""
+        """Get default PXBlendSC-RF configuration from ConfigDefaults."""
         return ConfigDefaults.PXBLENDSC_CONFIG.copy()
 
     async def train_model(self, request, training_data: list) -> dict:
-        """Train a PXBlendSC model."""
-        logger.info(f"Training PXBlendSC model: {request.modelCard.name}")
+        """Train a PXBlendSC-RF model."""
+        logger.info(f"Training PXBlendSC-RF model: {request.modelCard.name}")
 
         if not training_data:
             raise ValidationException("No training data provided")
@@ -2166,12 +2355,12 @@ class PXBlendSCStrategy(MLModelStrategy):
         except Exception as e:
             # Add more detailed error logging
             logger.error(
-                f"PXBlendSC training error details: {type(e).__name__}: {str(e)}"
+                f"PXBlendSC-RF training error details: {type(e).__name__}: {str(e)}"
             )
             import traceback
 
             logger.error(f"Full traceback: {traceback.format_exc()}")
-            raise InternalException(f"PXBlendSC training failed: {str(e)}") from e
+            raise InternalException(f"PXBlendSC-RF training failed: {str(e)}") from e
 
         # Save model
         temp_dir = tempfile.mkdtemp(prefix="pxblendsc_")
@@ -2183,7 +2372,7 @@ class PXBlendSCStrategy(MLModelStrategy):
         )
 
         logger.info(
-            f"PXBlendSC training completed:\n"
+            f"PXBlendSC-RF training completed:\n"
             f"  Validation: F1={metrics['cv_macro_f1']:.4f}, "
             f"Acc={metrics['cv_accuracy']:.4f}, "
             f"Abstain={metrics['cv_abstain_rate']:.2%}"
@@ -2194,11 +2383,11 @@ class PXBlendSCStrategy(MLModelStrategy):
     async def predict(
         self, model: dict, input_data: list
     ) -> list[CategoricalPredictionResult]:
-        """Generate predictions using PXBlendSC model."""
+        """Generate predictions using PXBlendSC-RF model."""
         bundle_path = model.get("bundle_path")
 
         if not bundle_path or not os.path.exists(bundle_path):
-            raise InternalException("PXBlendSC model not found or path invalid")
+            raise InternalException("PXBlendSC-RF model not found or path invalid")
 
         try:
             # Load the model bundle
@@ -2217,11 +2406,11 @@ class PXBlendSCStrategy(MLModelStrategy):
             return self._convert_predictions_to_thrift(predictions)
 
         except Exception as e:
-            logger.error(f"PXBlendSC prediction error: {e}")
+            logger.error(f"PXBlendSC-RF prediction error: {e}")
             raise InternalException(f"Prediction failed: {str(e)}") from e
 
     async def evaluate_model(self, model: dict, test_data_path: str) -> dict:
-        """Evaluate a trained PXBlendSC model on test data."""
+        """Evaluate a trained PXBlendSC-RF model on test data."""
         try:
             bundle_path = model.get("bundle_path")
             if not bundle_path or not os.path.exists(bundle_path):
@@ -2313,11 +2502,11 @@ class PXBlendSCStrategy(MLModelStrategy):
         if config_service:
             try:
                 cfg = await config_service.getPXBlendSCConfig()
-                logger.info("Using PXBlendSC configuration from Configs service")
+                logger.info("Using PXBlendSC-RF configuration from Configs service")
                 return cfg
             except Exception as e:
                 logger.warning(
-                    f"Failed to get PXBlendSC config from service: {e}, using defaults"
+                    f"Failed to get PXBlendSC-RF config from service: {e}, using defaults"
                 )
 
         logger.warning("Config service not available, using default configuration")

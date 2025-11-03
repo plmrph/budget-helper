@@ -183,7 +183,7 @@ def thrift_to_dict(thrift_obj):
         return None
 
     # Handle primitive types
-    if isinstance(thrift_obj, (str, int, float, bool)):
+    if isinstance(thrift_obj, str | int | float | bool):
         return thrift_obj
 
     # Handle lists
@@ -841,41 +841,45 @@ def _compute_transaction_diff(
             )
 
     # Deleted (present locally, missing in remote)
-    for tid, l in local_map.items():
+    for tid, local_txn in local_map.items():
         if tid not in remote_map:
             diffs.append(
                 TransactionDiffItem(
                     transaction_id=tid or "",
                     action="delete",
-                    local=l,
+                    local=local_txn,
                     remote=None,
                     changes=[
                         DiffChange(field=k, from_value=v, to_value=None)
-                        for k, v in l.items()
+                        for k, v in local_txn.items()
                         if k != "id"
                     ],
                 )
             )
 
     # Updated (in both but fields differ)
-    for tid, l in local_map.items():
+    for tid, local_txn in local_map.items():
         if tid in remote_map:
-            r = remote_map[tid]
+            remote_txn = remote_map[tid]
             field_changes: list[DiffChange] = []
-            for k in set(l.keys()) | set(r.keys()):
+            for k in set(local_txn.keys()) | set(remote_txn.keys()):
                 if k == "id":
                     continue
-                if l.get(k) != r.get(k):
+                if local_txn.get(k) != remote_txn.get(k):
                     field_changes.append(
-                        DiffChange(field=k, from_value=l.get(k), to_value=r.get(k))
+                        DiffChange(
+                            field=k,
+                            from_value=local_txn.get(k),
+                            to_value=remote_txn.get(k),
+                        )
                     )
             if field_changes:
                 diffs.append(
                     TransactionDiffItem(
                         transaction_id=tid or "",
                         action="update",
-                        local=l,
-                        remote=r,
+                        local=local_txn,
+                        remote=remote_txn,
                         changes=field_changes,
                     )
                 )
@@ -1209,7 +1213,6 @@ async def apply_sync_out(
 
         # Load selected local transactions
         all_local = await transaction_manager.getAllTransactions()
-
 
         id_map = {t.id: t for t in all_local}
         to_send = [id_map[tid] for tid in target_ids if tid in id_map]

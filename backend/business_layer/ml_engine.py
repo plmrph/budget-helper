@@ -166,12 +166,12 @@ class MLEngine:
                         self.model_storage_path, f"{model_info.name}.pkl"
                     )
                     if os.path.exists(model_path):
-                        # Load model to check if it's PXBlendSC and has bundle directory
+                        # Load model to check if it's PXBlendSC-RF and has bundle directory
                         try:
                             with open(model_path, "rb") as f:
                                 model_data = pickle.load(f)
 
-                            # Delete PXBlendSC bundle directory if it exists
+                            # Delete PXBlendSC-RF bundle directory if it exists
                             if (
                                 model_data.get("strategy")
                                 == ModelType._VALUES_TO_NAMES.get(
@@ -185,7 +185,7 @@ class MLEngine:
                                 )
                         except Exception as e:
                             logger.warning(
-                                f"Could not clean up PXBlendSC files for {model_info.name}: {e}"
+                                f"Could not clean up PXBlendSC-RF-RF files for {model_info.name}: {e}"
                             )
 
                         os.remove(model_path)
@@ -841,11 +841,11 @@ class MLEngine:
             # Clean up model file if it exists
             if os.path.exists(model_path):
                 try:
-                    # Load model to check if it's PXBlendSC and has bundle directory
+                    # Load model to check if it's PXBlendSC-RF and has bundle directory
                     with open(model_path, "rb") as f:
                         model_data = pickle.load(f)
 
-                    # Delete PXBlendSC bundle directory if it exists
+                    # Delete PXBlendSC-RF bundle directory if it exists
                     if (
                         model_data.get("strategy")
                         == ModelType._VALUES_TO_NAMES.get(ModelType.PXBlendSC).lower()
@@ -855,7 +855,7 @@ class MLEngine:
                         shutil.rmtree(model_data["bundle_path"], ignore_errors=True)
                 except Exception as e:
                     logger.warning(
-                        f"Could not clean up PXBlendSC files for {modelCard.name}: {e}"
+                        f"Could not clean up PXBlendSC-RF files for {modelCard.name}: {e}"
                     )
 
                 os.remove(model_path)
@@ -927,7 +927,7 @@ class MLEngine:
             else:
                 logger.info(f"No test data found at {test_data_path}")
 
-            # For PXBlendSC models, we need to handle the bundle path
+            # For PXBlendSC-RF models, we need to handle the bundle path
             if (
                 model.get("strategy")
                 == ModelType._VALUES_TO_NAMES.get(ModelType.PXBlendSC).lower()

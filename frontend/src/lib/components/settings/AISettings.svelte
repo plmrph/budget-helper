@@ -170,11 +170,6 @@
           A score of 0.70+ is good, 0.80+ is excellent.
         </div>
         <div>
-          <strong>Final Test Metrics:</strong> Performance of a model retrained on more data and tested 
-          on a held-out set. Often performs better than validation due to more training data.
-          Large differences may indicate data distribution changes.
-        </div>
-        <div>
           <strong>Abstain Rate:</strong> Percentage of predictions where the model wasn't confident enough
           to make a guess. Higher abstain rates mean fewer automatic categorizations but higher accuracy.
         </div>

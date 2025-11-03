@@ -76,7 +76,7 @@ Machine learning enables automatic category prediction for transactions. The wor
 To set up ML:
 1. Go to the ML Training page in the application (button in the top right)
 2. Create a dataset from your transactions (recommended: at least 500-1000 categorized transactions for good performance. If you didn't import enough Transactions when Syncing the Budget, go back and import more)
-3. Train a model using the PXBlendSC strategy
+3. Train a model using the PXBlendSC-RF strategy
 4. Once training completes, review the performance metrics of the model. If they look good, set it as your default model on the Model Management page
 5. Use predictions on the Transactions page for individual or batch categorization
 
@@ -120,7 +120,7 @@ Your financial data never leaves your machine. The application runs entirely in 
 ![Email Popup](screenshots/Email%20popup.jpg)
 
 ### Machine Learning Predictions
-- **PXBlendSC Strategy**: Advanced ensemble model combining LightGBM and SVM with sophisticated feature engineering
+- **PXBlendSC-RF Strategy**: Advanced ensemble model combining LightGBM and SVM with sophisticated feature engineering
 - **Pattern Recognition**: Learns from payee names, amounts, dates, account patterns, and transaction combinations
 - **Adaptive Thresholds**: Smart abstention when confidence is low to avoid incorrect categorizations during training. However during prediction the model will always give a result and the confidence level floor is 10%.
 - **Batch Predictions**: Categorize multiple transactions at once with confidence scores
@@ -197,6 +197,6 @@ The application is designed for extensibility through well-defined interfaces:
 
 - **Budget Platform**: Implement `BudgetingPlatformAccess` interface to support budget platforms beyond YNAB
 - **Email Platform**: Implement `MetadataSourceAccess` interface to add support for email providers beyond Gmail  
-- **ML Models**: Implement `MLModelStrategy` interface to add new machine learning approaches beyond PXBlendSC
+- **ML Models**: Implement `MLModelStrategy` interface to add new machine learning approaches beyond PXBlendSC-RF
 
 For detailed implementation guidance, see the [Backend README](backend/README.md) and [Frontend README](frontend/README.md).

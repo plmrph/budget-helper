@@ -1921,7 +1921,7 @@ async function pollTrainingStatus(modelNameToPoll) {
                     disabled={trainingInProgress}
                   />
                   <p class="text-sm text-muted-foreground">
-                    PXBlendSC will train LightGBM and SVM models with advanced
+                    PXBlendSC will train LightGBM and SVM models with
                     feature engineering within this time limit. Longer training
                     typically produces better models.
                   </p>

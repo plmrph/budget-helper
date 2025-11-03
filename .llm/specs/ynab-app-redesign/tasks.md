@@ -115,7 +115,7 @@
 
 - [ ] 16. Complete transaction API endpoints
   - Implement missing transaction operations (batch updates, metadata attachment)
-  - Add transaction filtering with advanced search capabilities
+  - Add transaction filtering with search capabilities
   - Implement transaction history and undo functionality
   - Add transaction synchronization endpoints
   - _Requirements: 2.2, 2.3, 2.4, 6.1, 6.2, 6.3_

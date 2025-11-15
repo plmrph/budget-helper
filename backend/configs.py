@@ -66,7 +66,7 @@ class ConfigKeys:
     AI_TRAINING_DATA_MONTHS = "ai.training_data_months"
     AI_TRAINING_TIME_MINUTES = "ai.training_time_minutes"
 
-    # PXBlendSC ML Strategy configuration
+    # PXBlendSC-RF ML Strategy configuration
     PXBLENDSC_CONFIG = "ai.pxblendsc_config"
 
     # Authentication configuration keys
@@ -132,7 +132,7 @@ class ConfigDefaults:
     TRAINING_DATA_MONTHS = 6
     TRAINING_TIME_MINUTES = 15
 
-    # PXBlendSC default configuration
+    # PXBlendSC-RF default configuration
     PXBLENDSC_CONFIG = {
         "columns": {
             "LABEL_COL": "category_name",
@@ -141,33 +141,49 @@ class ConfigDefaults:
             "DATE_COL": "date",
         },
         "random_state": 42,
-        "cv": {"n_folds": 3, "force_folds": True}, # Force 3 folds. Slower and drops more rare categories but better performance.
+        "cv": {
+            "n_folds": 3,
+            "force_folds": True,
+        },  # Force 3 folds. Slower and drops more rare categories but better performance.
         "parallel": {"n_jobs_cv": None, "threads_per_fold": None},
         "models": {
             "use_lgbm": True,
             "use_svm_blend": True,
+            "use_recency_frequency": True,
             "svm_calibration": "sigmoid",
-            "lgbm_weight": 0.7,  # Increased LGBM weight due to better performance
+            "lgbm_weight": 0.4,
+            "svm_weight": 0.2,
+            "recency_freq_weight": 0.4,
             # Adaptive training strategies for small classes
             "adaptive_splitting": True,  # Use adaptive train/test split for better small class performance
             "final_retraining": True,  # Retrain final model on all data (training + test) after evaluation
+            "recency_freq_params": {
+                "recency_weight": 0.6,  # How much to weight recent vs frequent
+                "frequency_weight": 0.4,
+                "min_frequency": 3,  # Ignore one-off categories
+                "lookback_window": 50,  # Consider last 50 transactions per payee
+                "recency_window": 5,  # Weight last 5 transactions heavily
+            },
             "lgbm_params": {
-                "learning_rate": 0.08,
-                "n_estimators": 2000,
+                "learning_rate": 0.03,
+                "n_estimators": 750,
                 "subsample": 0.85,
                 "colsample_bytree": 0.85,
-                "reg_lambda": 2.0,
-                "reg_alpha": 0.5,
-                "min_child_samples": 10,
+                "reg_lambda": 20.0,
+                "reg_alpha": 7.0,
+                "min_child_samples": 30,
+                "num_leaves": 20,
+                "max_depth": 5,
                 "force_row_wise": True,
                 "verbosity": -1,
+                "early_stopping_rounds": 50,
             },
         },
         "features": {
-            "tfidf_word_max_features": 150000,
-            "tfidf_char_max_features": 75000,
+            "tfidf_word_max_features": 5000,
+            "tfidf_char_max_features": 2500,
             "hashed_cross": {
-                "n_features": 131072,
+                "n_features": 4096,
                 "payee_min_count": 3,
                 "quantiles": [0.15, 0.3, 0.5, 0.7, 0.85],
                 "sign_bins": "two_sided",
@@ -177,7 +193,6 @@ class ConfigDefaults:
             },
         },
         "sampler": {"ros_cap_percentile": 60},
-        "alias": {"generic_noise": True},
         "priors": {
             "vendor": {"min_count": 3, "hard_override_share": 0.85, "beta": 2.0},
             "recency": {"k_last": 8, "beta": 1.5},
@@ -196,11 +211,6 @@ class ConfigDefaults:
                 0.2,
                 0.25,
                 0.3,
-                0.35,
-                0.4,
-                0.45,
-            ],  # Lower tail thresholds
-            "tail_grid": [
                 0.35,
                 0.375,
                 0.4,
@@ -507,7 +517,7 @@ class ConfigService:
         await self.updateConfigs([config_item])
 
     async def getPXBlendSCConfig(self):
-        """Get the PXBlendSC configuration as a dictionary."""
+        """Get the PXBlendSC-RF configuration as a dictionary."""
         # Return the config from code defaults for easier development iteration
         # return ConfigDefaults.PXBLENDSC_CONFIG
         return json.loads(await self.getConfigValue(ConfigKeys.PXBLENDSC_CONFIG, ConfigDefaults.PXBLENDSC_CONFIG))
@@ -785,7 +795,7 @@ class ConfigService:
                         value=ConfigValue(
                             stringValue=json.dumps(ConfigDefaults.PXBLENDSC_CONFIG)
                         ),
-                        description="PXBlendSC ML strategy configuration parameters",
+                        description="PXBlendSC-RF ML strategy configuration parameters",
                     ),
                 ]
             )

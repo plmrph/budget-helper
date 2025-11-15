@@ -23,9 +23,9 @@ from thrift_gen.entities.ttypes import (
     EntityType,
     ModelCard,
     ModelType,
+    PrimitiveValue,
     TrainingStatus,
     Transactions,
-    PrimitiveValue,
 )
 from thrift_gen.exceptions.ttypes import (
     ConflictException,

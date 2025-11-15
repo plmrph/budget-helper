@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from api_layer.dependencies import get_transaction_manager
-from configs import ConfigDefaults, ConfigKeys
+from configs import ConfigKeys
 from models.email import Email
 from thrift_gen.entities.ttypes import (
     EmailPlatformType,

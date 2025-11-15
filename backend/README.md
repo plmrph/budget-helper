@@ -163,7 +163,7 @@ backend/
 ├── business_layer/                    # Business logic and strategies
 │   ├── ml_engine.py                   # ML operations engine
 │   ├── ml_strategy_base.py            # ML strategy interface
-│   ├── pxblendsc_strategy.py          # PXBlendSC ML implementation
+│   ├── pxblendsc_strategy.py          # PXBlendSC-RF ML implementation
 │   └── metadata_finding_engine.py     # Email/metadata search
 ├── resource_layer/                    # Resource access layer
 │   ├── database_store_access/         # Database operations

@@ -19,6 +19,7 @@ from thrift_gen.databasestoreaccess.ttypes import (
 from thrift_gen.entities.ttypes import (
     EntityType,
     MetadataType,
+    PrimitiveValue,
     Transactions,
 )
 from thrift_gen.exceptions.ttypes import (
@@ -33,7 +34,6 @@ from thrift_gen.metadatasourceaccess.ttypes import (
     MetadataSourceQuery,
     MetadataSourceType,
 )
-from thrift_gen.entities.ttypes import PrimitiveValue
 
 logger = logging.getLogger(__name__)
 
@@ -788,7 +788,9 @@ class MetadataFindingEngine:
                 if candidate.metadata.properties is None:
                     candidate.metadata.properties = {}
                 # Use key 'relevance' to store the numeric score
-                candidate.metadata.properties["relevance"] = PrimitiveValue(doubleValue=score)
+                candidate.metadata.properties["relevance"] = PrimitiveValue(
+                    doubleValue=score
+                )
 
                 scored_candidates.append((score, candidate))
 

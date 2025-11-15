@@ -1,15 +1,16 @@
-# Machine Learning Strategy: PXBlendSC
+# Machine Learning Strategy: PXBlendSC-RF
 
-The Budget Helper uses the **PXBlendSC** (Prefix-eXamination Blend with Semantic Classification) ML strategy for intelligent transaction categorization. This advanced ensemble approach combines multiple machine learning techniques with domain-specific financial transaction understanding.
+The Budget Helper uses the **PXBlendSC-RF** (Prefix-eXamination Blend with Semantic Classification + Recency-Frequency) ML strategy for intelligent transaction categorization. This ensemble approach combines multiple machine learning techniques with domain-specific financial transaction understanding and historical pattern recognition.
 
 ## Overview
 
-PXBlendSC is a sophisticated ML pipeline that learns patterns from your historical transaction data to predict categories for new transactions. It combines:
+PXBlendSC-RF is a sophisticated ML pipeline that learns patterns from your historical transaction data to predict categories for new transactions. It combines:
 
-- **Ensemble Learning**: LightGBM + SVM models with optimized blending
+- **Three-Model Ensemble**: LightGBM + SVM + Recency-Frequency models with optimized blending
 - **Advanced Feature Engineering**: Text, numerical, temporal, and cross-feature extraction  
 - **Prefix Classification**: Pattern matching for vendor/payee recognition
 - **Memory Priors**: Learning from recent transaction patterns
+- **Recency-Frequency Model**: Historical payee categorization patterns
 - **Adaptive Thresholds**: Smart abstention when confidence is low
 
 ## Feature Engineering
@@ -20,7 +21,7 @@ The system extracts multiple types of text features from transaction description
 #### TF-IDF Features
 - **Word-level TF-IDF**: Captures important words and phrases in payee names and memos
 - **Character-level TF-IDF**: Learns character patterns for vendor name variations
-- **Max Features**: 150,000 word features + 75,000 character features for comprehensive coverage
+- **Max Features**: 5,000 word features + 2,500 character features optimized to reduce overfitting
 
 #### Cross-Features (Hashed)
 Advanced feature combinations that capture relationships between transaction elements:
@@ -65,6 +66,37 @@ Account + Category Patterns:
 - **Recency Weighting**: More recent transactions influence predictions more strongly
 - **Seasonal Patterns**: Monthly and seasonal spending pattern recognition
 
+### Recency-Frequency Model
+The recency-frequency model learns from your historical payee categorization patterns:
+
+#### How It Works:
+- **Frequency Score**: How often you've categorized a payee to each category
+- **Recency Score**: How recently you've categorized a payee to each category  
+- **Combined Prediction**: Weighted combination favoring recent patterns over historical frequency
+- **Smart Filtering**: Only considers patterns used multiple times to avoid one-off mistakes
+
+#### Example Behavior:
+```
+VENMO (John Smith) - 10 historical transactions:
+- 8x "Personal/Friends", 2x "Food/Dining"
+- Last 5 transactions: 4x "Personal", 1x "Food"
+
+Frequency Score: Personal=80%, Food=20%
+Recency Score: Personal=80%, Food=20%
+Final Prediction: Personal=80%, Food=20%
+
+But if recent pattern changes:
+- Last 5 transactions: 2x "Personal", 3x "Food"
+Recency Score: Personal=40%, Food=60%
+Final Prediction: Personal=56%, Food=44% (weighted toward recent change)
+```
+
+#### Benefits:
+- **Intuitive Predictions**: Matches how users naturally think about categorization
+- **Handles Pattern Changes**: Adapts when spending patterns evolve
+- **Reduces Edge Case Errors**: Frequency requirement prevents one-off mistakes from dominating
+- **Complements ML Models**: Provides different signal than feature-based learning
+
 ## PXBLENDSC_CONFIG Parameters
 
 The configuration in `configs.py` controls all aspects of the ML strategy:
@@ -82,11 +114,21 @@ The configuration in `configs.py` controls all aspects of the ML strategy:
 ### Model Configuration (models)
 ```python
 "models": {
-    "use_lgbm": True,           # Enable LightGBM (gradient boosting)
-    "use_svm_blend": True,      # Enable SVM component
-    "lgbm_weight": 0.7,         # LightGBM weight in ensemble (70%)
-    "adaptive_splitting": True, # Adaptive train/test split for small classes
-    "final_retraining": True    # Retrain on all data after evaluation
+    "use_lgbm": True,                    # Enable LightGBM (gradient boosting)
+    "use_svm_blend": True,               # Enable SVM component
+    "use_recency_frequency": True,       # Enable recency-frequency model
+    "lgbm_weight": 0.4,                  # LightGBM weight in ensemble (40%)
+    "svm_weight": 0.2,                   # SVM weight in ensemble (20%)
+    "recency_freq_weight": 0.4,          # Recency-frequency weight in ensemble (40%)
+    "adaptive_splitting": True,          # Adaptive train/test split for small classes
+    "final_retraining": True,            # Retrain on all data after evaluation
+    "recency_freq_params": {
+        "recency_weight": 0.6,           # Weight for recent vs frequent patterns
+        "frequency_weight": 0.4,         # Weight for frequency patterns
+        "min_frequency": 3,              # Minimum times payee used for pattern
+        "lookback_window": 50,           # Consider last 50 transactions per payee
+        "recency_window": 5              # Weight last 5 transactions heavily
+    }
 }
 ```
 
@@ -94,20 +136,21 @@ The configuration in `configs.py` controls all aspects of the ML strategy:
 - **n_folds**: Higher folds will typically improve accuracy overall, but will end up dropping categories that don't have enough samples
 - **adaptive_splitting**: Improves accuracy on smaller categories, at the risk of having fewer test samples
 - **final_retraining**: Increases the overall training time, but helps with accuracy especially on smaller datasets or categories with fewer samples
-- **lgbm_weight**: Controls ensemble balance (0.7 = 70% LightGBM, 30% SVM)
+- **Ensemble weights**: Controls three-model balance (40% LightGBM, 20% SVM, 40% Recency-Frequency)
+- **Recency-frequency params**: Tunes how the model weighs recent vs frequent categorizations
 
 ### Feature Engineering (features)
 ```python
 "features": {
-    "tfidf_word_max_features": 150000,             # Maximum word-level features
-    "tfidf_char_max_features": 75000,              # Maximum character-level features
+    "tfidf_word_max_features": 5000,              # Maximum word-level features
+    "tfidf_char_max_features": 2500,              # Maximum character-level features
     "hashed_cross": {
-        "n_features": 131072,                      # Hash space for cross-features
-        "payee_min_count": 3,                      # Minimum payee frequency for features
-        "quantiles": [0.15, 0.3, 0.5, 0.7, 0.85],  # Amount binning
-        "emit_unaries": True,                      # Single field features
-        "emit_pairs": True,                        # Two-field combinations
-        "emit_triples": True                       # Three-field combinations
+        "n_features": 4096,                       # Hash space for cross-features
+        "payee_min_count": 3,                     # Minimum payee frequency for features
+        "quantiles": [0.15, 0.3, 0.5, 0.7, 0.85], # Amount binning
+        "emit_unaries": True,                     # Single field features
+        "emit_pairs": True,                       # Two-field combinations
+        "emit_triples": True                      # Three-field combinations
     }
 }
 ```
@@ -165,10 +208,10 @@ Remember, garbage in garbage out, so the better your data the better the model w
 4. **Cross-Feature Generation**: All pairwise and triple combinations
 
 ### 3. Model Training
-1. **Cross-Validation**: 3-fold validation for robust performance estimation
-2. **Ensemble Training**: Train both LightGBM and SVM components
-3. **Threshold Learning**: Learn optimal confidence thresholds per category
-4. **Final Retraining**: Train final model on all available data
+1. **Cross-Validation**: 3-fold validation for robust performance estimation with proper data isolation
+2. **Ensemble Training**: Train LightGBM, SVM, and Recency-Frequency components
+3. **Threshold Learning**: Learn optimal confidence thresholds per category using corrected F1 optimization
+4. **Final Retraining**: Train final model on all available data with early stopping
 
 ### 4. Model Evaluation
 - **Accuracy Metrics**: Overall accuracy, per-category F1 scores
@@ -181,9 +224,10 @@ Remember, garbage in garbage out, so the better your data the better the model w
 New transactions go through the same feature engineering pipeline as training data.
 
 ### 2. Ensemble Prediction
-- **LightGBM Prediction**: Gradient boosting model prediction
-- **SVM Prediction**: Support vector machine prediction  
-- **Weighted Combination**: Blend predictions using learned weights
+- **LightGBM Prediction**: Gradient boosting model prediction (40% weight)
+- **SVM Prediction**: Support vector machine prediction (20% weight)
+- **Recency-Frequency Prediction**: Historical pattern prediction (40% weight)
+- **Weighted Combination**: Blend predictions using optimized ensemble weights
 
 ### 3. Prior Integration
 - **Vendor Lookup**: Check if payee has strong historical patterns
@@ -242,8 +286,9 @@ The noise strings that get removed are defined in the `GENERIC_NOISE_PATTERNS` c
 ## Monitoring and Maintenance
 
 ### Model Performance Indicators
-- **Overall Accuracy**: Should be 85%+ on validation data. Accuracy means the percentage of transactions where the model's predicted category matches the actual category that was manually assigned.
-- **Abstention Rate**: Healthy models abstain on 15-25% of predictions. Abstaining means the model chooses not to make a prediction when its confidence is too low. This prevents incorrect categorizations but means some transactions won't get automatic predictions. During training, abstention helps improve the model's precision by avoiding low-confidence guesses. During prediction, the model will always give a result with a minimum confidence level of 10%.
+- **Overall Accuracy**: Should be 75%+ on validation data. Accuracy means the percentage of transactions where the model's predicted category matches the actual category that was manually assigned.
+- **Training vs Validation Gap**: Healthy models have <15% gap between training and validation accuracy. Large gaps indicate overfitting.
+- **Abstention Rate**: Abstaining means the model chooses not to make a prediction when its confidence is too low, which may happen for categories with few samples or inconsistent categorization. This prevents incorrect categorizations but means some transactions won't get automatic predictions. During training, abstention helps improve the model's precision by avoiding low-confidence guesses. During prediction, the model will always give a result with a minimum confidence level of 10%.
 - **Category Coverage**: All major categories should have reasonable F1 scores
 
 ### When to Retrain
@@ -275,7 +320,7 @@ The noise strings that get removed are defined in the `GENERIC_NOISE_PATTERNS` c
       "value": {
         "stringValue": "{\"columns\": {\"LABEL_COL\": \"category_name\", \"TEXT_COLS\": [\"payee_name\", \"memo\", \"account_name\"], \"NUM_COLS\": [\"amount\"], \"DATE_COL\": \"date\"}, \"random_state\": 42, \"cv\": {\"n_folds\": 3, \"force_folds\": true}, \"parallel\": {\"n_jobs_cv\": null, \"threads_per_fold\": null}, \"models\": {\"use_lgbm\": true, \"use_svm_blend\": true, \"svm_calibration\": \"sigmoid\", \"lgbm_weight\": 0.7, \"adaptive_splitting\": true, \"final_retraining\": true, \"lgbm_params\": {\"learning_rate\": 0.08, \"n_estimators\": 2000, \"subsample\": 0.85, \"colsample_bytree\": 0.85, \"reg_lambda\": 2.0, \"reg_alpha\": 0.5, \"min_child_samples\": 10, \"force_row_wise\": true, \"verbosity\": -1}}, \"features\": {\"tfidf_word_max_features\": 150000, \"tfidf_char_max_features\": 75000, \"hashed_cross\": {\"n_features\": 131072, \"payee_min_count\": 3, \"quantiles\": [0.15, 0.3, 0.5, 0.7, 0.85], \"sign_bins\": \"two_sided\", \"emit_unaries\": true, \"emit_pairs\": true, \"emit_triples\": true}}, \"sampler\": {\"ros_cap_percentile\": 60}, \"alias\": {\"generic_noise\": true, \"custom_map_path\": null}, \"priors\": {\"vendor\": {\"min_count\": 3, \"hard_override_share\": 0.85, \"beta\": 2.0}, \"recency\": {\"k_last\": 8, \"beta\": 1.5}, \"backoff\": {\"global\": 0.4}}, \"thresholds\": {\"mode\": \"learn\", \"global_grid\": [0.15, 0.2, 0.25, 0.3, 0.35], \"tail_support_max\": 8, \"tail_f1_max\": 0.25, \"tail_grid\": [0.35, 0.375, 0.4, 0.425, 0.45, 0.475, 0.5, 0.525, 0.55, 0.575, 0.6, 0.625, 0.65, 0.675, 0.7]}}"
       },
-      "description": "PXBlendSC ML strategy configuration parameters"
+      "description": "PXBlendSC-RF ML strategy configuration parameters"
     },
 ```
 
@@ -483,7 +528,7 @@ If you don't want to do the manual steps above, and are comfortable using LLMs (
 #### Prompt:
 ># Prompt: PXBlendSC Auto-Tuning Assistant
 >
->You are helping me tune a transaction-categorization ML pipeline called **PXBlendSC**. I >will provide:
+>You are helping me tune a transaction-categorization ML pipeline called **PXBlendSC-RF**. I >will provide:
 >
 >* The current **Model Configuration** JSON (`ai.pxblendsc_config`),
 >* **Validation Performance Metrics** (accuracy, macro-F1, balanced accuracy, abstain >rate, sample counts, etc.),
@@ -548,7 +593,7 @@ If you don't want to do the manual steps above, and are comfortable using LLMs (
 >    "value": {
 >      "stringValue": "{\"columns\": {\"LABEL_COL\": \"category_name\", \"TEXT_COLS\": [\"payee_name\", \"memo\", \"account_name\"], \"NUM_COLS\": [\"amount\"], \"DATE_COL\": \"date\"}, \"random_state\": 42, \"cv\": {\"n_folds\": 3, \"force_folds\": true}, \"parallel\": {\"n_jobs_cv\": null, \"threads_per_fold\": null}, \"models\": {\"use_lgbm\": true, \"use_svm_blend\": true, \"svm_calibration\": \"sigmoid\", \"lgbm_weight\": 0.7, \"adaptive_splitting\": true, \"final_retraining\": true, \"lgbm_params\": {\"learning_rate\": 0.08, \"n_estimators\": 2000, \"subsample\": 0.85, \"colsample_bytree\": 0.85, \"reg_lambda\": 2.0, \"reg_alpha\": 0.5, \"min_child_samples\": 10, \"force_row_wise\": true, \"verbosity\": -1}}, \"features\": {\"tfidf_word_max_features\": 150000, \"tfidf_char_max_features\": 75000, \"hashed_cross\": {\"n_features\": 131072, \"payee_min_count\": 3, \"quantiles\": [0.15, 0.3, 0.5, 0.7, 0.85], \"sign_bins\": \"two_sided\", \"emit_unaries\": true, \"emit_pairs\": true, \"emit_triples\": true}}, \"sampler\": {\"ros_cap_percentile\": 60}, \"alias\": {\"generic_noise\": true, \"custom_map_path\": null}, \"priors\": {\"vendor\": {\"min_count\": 3, \"hard_override_share\": 0.85, \"beta\": 2.0}, \"recency\": {\"k_last\": 8, \"beta\": 1.5}, \"backoff\": {\"global\": 0.4}}, \"thresholds\": {\"mode\": \"learn\", \"global_grid\": [0.15, 0.2, 0.25, 0.3, 0.35], \"tail_support_max\": 8, \"tail_f1_max\": 0.25, \"tail_grid\": [0.35, 0.375, 0.4, 0.425, 0.45, 0.475, 0.5, 0.525, 0.55, 0.575, 0.6, 0.625, 0.65, 0.675, 0.7]}}"
 >    },
->    "description": "PXBlendSC ML strategy configuration parameters"
+>    "description": "PXBlendSC-RF ML strategy configuration parameters"
 >  }
 >}
 >```

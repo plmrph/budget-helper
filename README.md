@@ -120,7 +120,7 @@ Your financial data never leaves your machine. The application runs entirely in 
 ![Email Popup](screenshots/Email%20popup.jpg)
 
 ### Machine Learning Predictions
-- **PXBlendSC-RF Strategy**: Advanced ensemble model combining LightGBM and SVM with sophisticated feature engineering
+- **PXBlendSC-RF Strategy**: Advanced ensemble model combining LightGBM and SVM with feature engineering
 - **Pattern Recognition**: Learns from payee names, amounts, dates, account patterns, and transaction combinations
 - **Adaptive Thresholds**: Smart abstention when confidence is low to avoid incorrect categorizations during training. However during prediction the model will always give a result and the confidence level floor is 10%.
 - **Batch Predictions**: Categorize multiple transactions at once with confidence scores

@@ -4,7 +4,7 @@ The Budget Helper uses the **PXBlendSC-RF** (Prefix-eXamination Blend with Seman
 
 ## Overview
 
-PXBlendSC-RF is a sophisticated ML pipeline that learns patterns from your historical transaction data to predict categories for new transactions. It combines:
+PXBlendSC-RF is a ML pipeline that learns patterns from your historical transaction data to predict categories for new transactions. It combines:
 
 - **Three-Model Ensemble**: LightGBM + SVM + Recency-Frequency models with optimized blending
 - **Advanced Feature Engineering**: Text, numerical, temporal, and cross-feature extraction  

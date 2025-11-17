@@ -46,7 +46,7 @@ frontend/
 ## Pages and Features
 
 ### Transactions Page
-The core of the application featuring a sophisticated data grid with powerful interaction capabilities:
+The core of the application featuring a data grid with powerful interaction capabilities:
 
 #### Transaction Grid Features
 - **Sortable Columns**: Click headers to sort by any field (date, amount, payee, category)

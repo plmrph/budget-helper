@@ -798,7 +798,6 @@ async def get_training_data_stats(
         dataset_info = result.datasetInfo
 
         # Calculate suitability metrics based on modern ML requirements
-        # Our PXBlendSC-RF strategy uses cross-validation, multiple models, and sophisticated features
         total_samples = dataset_info.trainingSamples
         num_categories = dataset_info.categories
         avg_samples_per_category = (
